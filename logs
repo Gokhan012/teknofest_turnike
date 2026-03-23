@@ -1,0 +1,20 @@
+import sqlite3
+
+def setup_logs_table():
+    conn = sqlite3.connect('turnike.db')
+    cursor = conn.cursor()
+    
+    # Geçiş kayıtları için tablo oluşturuyoruz
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_name TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("Geçiş kayıtları (logs) tablosu hazır.")
+
+setup_logs_table()

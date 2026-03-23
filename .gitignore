@@ -1,0 +1,24 @@
+# Python sanal ortamı
+venv/
+env/
+.env
+
+# Derlenmiş dosyalar ve cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mediapipe ve indirdiğimiz ağır paketler (.whl dosyaları)
+*.whl
+
+# Veritabanı loglar
+turnike.db
+*.db-journal
+
+# InsightFace modelleri 
+.insightface/
+models/
+
+# VS Code özel ayarları
+.vscode/
+.history/
