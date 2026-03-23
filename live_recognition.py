@@ -1,16 +1,3 @@
-"""
-Turnike Yüz Tanıma ve Canlılık Kontrol Sistemi v2.0
-Düzeltmeler:
-  - SESSION_TIMEOUT kullanılmıyordu → aktif oturum kontrolüne eklendi
-  - liveness_map her karede sıfırlanıyordu → tracker kayboluyordu (BUG)
-  - Yüz kutusu kırpma negatife düşebiliyordu → clamp eklendi
-  - face_app.get() her frame çağrılıyordu → throttle eklendi ama faces temizlenmiyordu
-  - Kamera açılamazsa sessizce çöküyordu → hata kontrolü eklendi
-  - put_turkish_text her frame'de font disk'ten yüklüyordu → önbelleğe alındı
-  - MediaPipe FaceMesh kapatılmıyordu → context manager / close() eklendi
-  - known_users başlangıçta yükleniyor ama kayıt sırasında güncellenmiyor → reload fonksiyonu
-  - Tek kez log atma mantığı kırıktı (aktif_sessions'ı kontrol ediyor ama set değil dict) → düzeltildi
-"""
 
 import cv2
 import sqlite3
