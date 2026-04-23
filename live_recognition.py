@@ -5,27 +5,51 @@ import time
 import os
 import logging
 import json
+import threading
+import queue
 from collections import deque
 from datetime import datetime
 from dataclasses import dataclass, asdict
 from enum import Enum
 from insightface.app import FaceAnalysis
-from PIL import ImageFont, ImageDraw, Image
 from scipy.spatial import distance as dist
 
 # ─────────────────────────────────────────────
-#  DOSYA YOLLARI  — script yanına sabit
+#  DOSYA YOLLARI
 # ─────────────────────────────────────────────
-_BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DB_PATH     = os.path.join(_BASE_DIR, "turnike.db")
-LOG_PATH    = os.path.join(_BASE_DIR, "turnike.log")
-SEC_PATH    = os.path.join(_BASE_DIR, "security.log")
-JSONL_PATH  = os.path.join(_BASE_DIR, "events.jsonl")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.path.join(_BASE_DIR, "turnike.db")
+LOG_PATH  = os.path.join(_BASE_DIR, "turnike.log")
+SEC_PATH  = os.path.join(_BASE_DIR, "security.log")
+JSONL_PATH= os.path.join(_BASE_DIR, "events.jsonl")
 
 # ─────────────────────────────────────────────
-#  LOG SİSTEMİ
+#  AYARLAR
 # ─────────────────────────────────────────────
+THRESHOLD           = 0.45
+SESSION_TIMEOUT     = 5.0
+FACE_ANALYZE_PERIOD = 0.25   
 
+CAM_WIDTH  = 640
+CAM_HEIGHT = 480
+CAM_FPS    = 30
+
+# Göz kırpma
+CALIBRATION_FRAMES = 60
+EAR_RATIO          = 0.72
+EAR_SMOOTH_N       = 2
+BLINK_WINDOW_SEC   = 6.0
+BLINK_REQUIRED     = 1
+BLINK_COOLDOWN     = 0.25
+BLINK_MS_MIN       = 60   
+BLINK_MS_MAX       = 400   
+
+LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_IDX = [33,  160, 158, 133, 153, 144]
+
+# ─────────────────────────────────────────────
+#  EVENTLER
+# ─────────────────────────────────────────────
 class EventType(str, Enum):
     SYSTEM_START    = "SYSTEM_START"
     SYSTEM_STOP     = "SYSTEM_STOP"
@@ -39,17 +63,20 @@ class EventType(str, Enum):
 
 @dataclass
 class LogEvent:
-    event_type:  str
-    timestamp:   str   = ""
-    unix_time:   float = 0.0
-    user_name:   str   = ""
-    similarity:  float = 0.0
-    spoof_reason:str   = ""
-    alert_level: str   = ""
-    face_box:    str   = ""
-    session_id:  str   = ""
-    extra:       str   = ""
+    event_type:   str
+    timestamp:    str   = ""
+    unix_time:    float = 0.0
+    user_name:    str   = ""
+    similarity:   float = 0.0
+    spoof_reason: str   = ""
+    alert_level:  str   = ""
+    face_box:     str   = ""
+    session_id:   str   = ""
+    extra:        str   = ""
 
+# ─────────────────────────────────────────────
+#  OPT-1: ASENKRON LOGGER — I/O ana thread'i bloklamaz
+# ─────────────────────────────────────────────
 class TurnikeLogger:
     SECURITY_EVENTS = {
         EventType.SPOOF_DETECTED,
@@ -61,27 +88,31 @@ class TurnikeLogger:
 
     def __init__(self):
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._q: "queue.Queue[LogEvent | None]" = queue.Queue()
         self._setup_loggers()
         self._setup_db()
         self._jsonl = open(JSONL_PATH, "a", encoding="utf-8")
+        # Kalıcı DB bağlantısı — her seferinde açıp kapama
+        self._db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self._db_conn.execute("PRAGMA journal_mode=WAL")   # eş zamanlı okuma
+        self._db_conn.execute("PRAGMA synchronous=NORMAL") # daha hızlı yazma
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
 
+    # ── Logger kurulum ────────────────────────────────────────────
     def _setup_loggers(self):
         fmt     = "%(asctime)s | %(levelname)-8s | %(message)s"
         datefmt = "%d-%m-%Y %H:%M:%S"
-
         self.main = logging.getLogger("turnike.main")
         self.main.setLevel(logging.DEBUG)
         if not self.main.handlers:
             self.main.addHandler(self._fh(LOG_PATH, fmt, datefmt))
             self.main.addHandler(self._sh(fmt, datefmt))
-
         self.sec = logging.getLogger("turnike.security")
         self.sec.setLevel(logging.WARNING)
         if not self.sec.handlers:
             self.sec.addHandler(self._fh(
-                SEC_PATH,
-                "%(asctime)s | SECURITY | %(message)s",
-                datefmt))
+                SEC_PATH, "%(asctime)s | SECURITY | %(message)s", datefmt))
 
     @staticmethod
     def _fh(path, fmt, datefmt):
@@ -96,55 +127,56 @@ class TurnikeLogger:
         return h
 
     def _setup_db(self):
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("""CREATE TABLE IF NOT EXISTS users (
-                id         INTEGER PRIMARY KEY,
-                name       TEXT NOT NULL,
-                student_id TEXT UNIQUE,
-                embedding  BLOB NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS access_log (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT,
-                event_type   TEXT NOT NULL,
-                user_name    TEXT,
-                similarity   REAL,
-                spoof_reason TEXT,
-                alert_level  TEXT,
-                face_box     TEXT,
-                extra        TEXT,
-                timestamp    TEXT NOT NULL,
-                unix_time    REAL NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS security_log (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT,
-                event_type   TEXT NOT NULL,
-                spoof_reason TEXT,
-                alert_level  TEXT,
-                face_box     TEXT,
-                user_name    TEXT,
-                timestamp    TEXT NOT NULL,
-                unix_time    REAL NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS logs (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_name TEXT NOT NULL,
-                timestamp TEXT NOT NULL)""")
-            conn.commit()
+        with sqlite3.connect(DB_PATH) as c:
+            c.executescript("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id         INTEGER PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    student_id TEXT UNIQUE,
+                    embedding  BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS access_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id   TEXT, event_type TEXT NOT NULL,
+                    user_name    TEXT, similarity REAL,
+                    spoof_reason TEXT, alert_level TEXT,
+                    face_box     TEXT, extra TEXT,
+                    timestamp    TEXT NOT NULL, unix_time REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS security_log (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id   TEXT, event_type TEXT NOT NULL,
+                    spoof_reason TEXT, alert_level TEXT,
+                    face_box     TEXT, user_name TEXT,
+                    timestamp    TEXT NOT NULL, unix_time REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS logs (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name TEXT NOT NULL, timestamp TEXT NOT NULL);
+            """)
+            c.commit()
+
+    # ── Kuyruk işçisi ─────────────────────────────────────────────
+    def _run(self):
+        while True:
+            ev = self._q.get()
+            if ev is None:
+                break
+            try:
+                self._write_db(ev)
+                self._jsonl.write(json.dumps(asdict(ev), ensure_ascii=False) + "\n")
+                self._jsonl.flush()
+            except Exception as ex:
+                self.main.error(f"Logger worker hatasi: {ex}")
 
     def log(self, event: LogEvent):
         event.session_id = self.session_id
         event.timestamp  = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
         event.unix_time  = time.time()
-
         msg = self._fmt(event)
         if event.event_type in self.SECURITY_EVENTS:
             self.main.warning(msg)
             self.sec.warning(msg)
         else:
             self.main.info(msg)
-
-        self._jsonl.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
-        self._jsonl.flush()
-        self._write_db(event)
+        self._q.put(event)   # I/O'yu arka plana gönder
 
     def _fmt(self, e: LogEvent) -> str:
         parts = [f"[{e.event_type}]"]
@@ -157,47 +189,40 @@ class TurnikeLogger:
         return "  ".join(parts)
 
     def _write_db(self, e: LogEvent):
-        try:
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    """INSERT INTO access_log
-                       (session_id, event_type, user_name, similarity,
-                        spoof_reason, alert_level, face_box, extra,
-                        timestamp, unix_time)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                    (e.session_id, e.event_type, e.user_name, e.similarity,
-                     e.spoof_reason, e.alert_level, e.face_box,
-                     e.extra, e.timestamp, e.unix_time))
-
-                if e.event_type in self.SECURITY_EVENTS:
-                    conn.execute(
-                        """INSERT INTO security_log
-                           (session_id, event_type, spoof_reason, alert_level,
-                            face_box, user_name, timestamp, unix_time)
-                           VALUES (?,?,?,?,?,?,?,?)""",
-                        (e.session_id, e.event_type, e.spoof_reason,
-                         e.alert_level, e.face_box, e.user_name,
-                         e.timestamp, e.unix_time))
-
-                if e.event_type == EventType.ACCESS_GRANTED and e.user_name:
-                    conn.execute(
-                        "INSERT INTO logs (user_name, timestamp) VALUES (?,?)",
-                        (e.user_name, e.timestamp))
-
-                conn.commit()
-        except sqlite3.Error as ex:
-            self.main.error(f"DB hatasi: {ex}")
+        c = self._db_conn
+        c.execute(
+            """INSERT INTO access_log
+               (session_id,event_type,user_name,similarity,
+                spoof_reason,alert_level,face_box,extra,timestamp,unix_time)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (e.session_id, e.event_type, e.user_name, e.similarity,
+             e.spoof_reason, e.alert_level, e.face_box,
+             e.extra, e.timestamp, e.unix_time))
+        if e.event_type in self.SECURITY_EVENTS:
+            c.execute(
+                """INSERT INTO security_log
+                   (session_id,event_type,spoof_reason,alert_level,
+                    face_box,user_name,timestamp,unix_time)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (e.session_id, e.event_type, e.spoof_reason,
+                 e.alert_level, e.face_box, e.user_name,
+                 e.timestamp, e.unix_time))
+        if e.event_type == EventType.ACCESS_GRANTED and e.user_name:
+            c.execute("INSERT INTO logs (user_name,timestamp) VALUES (?,?)",
+                      (e.user_name, e.timestamp))
+        c.commit()
 
     def close(self):
+        self._q.put(None)
+        self._worker.join(timeout=3)
         self._jsonl.close()
+        self._db_conn.close()
 
-# Global
 tlog: TurnikeLogger = None  # type: ignore
 
 # ─────────────────────────────────────────────
-#  ACİL DURUM YÖNETİCİSİ
+#  ALARM
 # ─────────────────────────────────────────────
-
 class AlertLevel(str, Enum):
     NONE     = "NONE"
     WARNING  = "WARNING"
@@ -241,57 +266,66 @@ class AlertManager:
             self.lockout_until = 0.0
 
 # ─────────────────────────────────────────────
-#  AYARLAR
-# ─────────────────────────────────────────────
-THRESHOLD           = 0.45
-SESSION_TIMEOUT     = 5.0
-FACE_ANALYZE_PERIOD = 0.25
-
-# Göz kırpma — iyileştirilmiş parametreler
-# Göz kırpma parametreleri
-CALIBRATION_FRAMES  = 60
-EAR_RATIO           = 0.72        # açık EAR'ın bu oranı altı = kapalı
-EAR_SMOOTH_N        = 2           # moving-average pencere (gürültü bastırma)
-BLINK_WINDOW_SEC    = 6.0
-BLINK_REQUIRED      = 1
-BLINK_COOLDOWN      = 0.25        # iki kırpma arası min bekleme (s)
-
-LEFT_EYE_IDX  = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE_IDX = [33,  160, 158, 133, 153, 144]
-
-# ─────────────────────────────────────────────
-#  FONT
-# ─────────────────────────────────────────────
-_font_cache: dict = {}
-
-def _font(size: int):
-    if size not in _font_cache:
-        for p in [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ]:
-            if os.path.exists(p):
-                _font_cache[size] = ImageFont.truetype(p, size)
-                return _font_cache[size]
-        _font_cache[size] = ImageFont.load_default()
-    return _font_cache[size]
-
-def put_text(img, text, pos, size=20, color=(255, 255, 255)):
-    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    ImageDraw.Draw(pil).text(pos, text, font=_font(size), fill=color)
-    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-
-# ─────────────────────────────────────────────
-#  VERİTABANI
+#  OPT-2: VERİTABANI — normalize edilmiş embeddingler
 # ─────────────────────────────────────────────
 def load_known_faces() -> list:
+    """Embeddinglieri yükle ve normalize et (dot product = cosine similarity)."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             rows = conn.execute("SELECT name, embedding FROM users").fetchall()
-        return [{"name": r[0], "emb": np.frombuffer(r[1], dtype=np.float32)} for r in rows]
+        result = []
+        for r in rows:
+            emb = np.frombuffer(r[1], dtype=np.float32).copy()
+            norm = np.linalg.norm(emb)
+            if norm > 1e-6:
+                emb /= norm
+            result.append({"name": r[0], "emb": emb})
+        return result
     except sqlite3.Error as e:
         logging.error(f"Yukleme hatasi: {e}")
         return []
+
+# ─────────────────────────────────────────────
+#  OPT-3: TOPLU MATRİS KARŞILAŞTIRMASI
+# ─────────────────────────────────────────────
+class FaceDatabase:
+    """Tüm known face embeddinglierini matrise yükle — batch dot product."""
+
+    def __init__(self, known: list):
+        self.names = [u["name"] for u in known]
+        if known:
+            self.matrix = np.stack([u["emb"] for u in known], axis=0)  # (N, D)
+        else:
+            self.matrix = np.empty((0, 512), dtype=np.float32)
+
+    def recognize(self, emb: np.ndarray) -> tuple[str, float]:
+        if self.matrix.shape[0] == 0:
+            return "Bilinmeyen", 0.0
+        # Normalize et
+        n = np.linalg.norm(emb)
+        if n > 1e-6:
+            emb = emb / n
+        sims = self.matrix @ emb          # (N,) — tek matris çarpımı
+        idx  = int(np.argmax(sims))
+        sim  = float(sims[idx])
+        name = self.names[idx] if sim >= THRESHOLD else "Bilinmeyen"
+        return name, sim
+
+# ─────────────────────────────────────────────
+#  OPT-4: SKALASIZ TEXT ÇIZIMI — PIL'siz, OpenCV native
+# ─────────────────────────────────────────────
+
+_TR_MAP = str.maketrans("çğışöüÇĞİŞÖÜ", "cgisouCGISOu")
+
+def _ascii(s: str) -> str:
+    return s.translate(_TR_MAP)
+
+def put_text_fast(img, text: str, pos: tuple,
+                  scale: float = 0.55,
+                  color=(240, 240, 240),
+                  thickness: int = 1):
+    cv2.putText(img, _ascii(text), pos,
+                cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 # ─────────────────────────────────────────────
 #  YARDIMCILAR
@@ -304,52 +338,27 @@ def ear_val(lm, idx, w, h):
     return (A + B) / (2.0 * C + 1e-6)
 
 def iou(a, b):
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
     inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
     aA = max(1, (a[2]-a[0]) * (a[3]-a[1]))
     aB = max(1, (b[2]-b[0]) * (b[3]-b[1]))
     return inter / (aA + aB - inter + 1e-6)
 
-def recognize(emb, known):
-    best_name, best_sim = "Bilinmeyen", 0.0
-    for u in known:
-        s = float(np.dot(emb, u["emb"]))
-        if s > best_sim:
-            best_sim  = s
-            best_name = u["name"] if s >= THRESHOLD else "Bilinmeyen"
-    return best_name, best_sim
-
 def box_str(x1, y1, x2, y2): return f"{x1},{y1},{x2},{y2}"
 
 # ─────────────────────────────────────────────
-#  GÖZ KIRPMA  —  iyileştirilmiş
+#  GÖZ KIRPMA
 # ─────────────────────────────────────────────
 class BlinkDetector:
-    """
-    Süre tabanlı göz kırpma tespiti.
-
-    Gerçek insan kırpması: ~150–400 ms
-      → 80 ms altı  : titreme / gürültü → sayılmaz
-      → 350 ms üstü : kasıtlı kapama / uyuma → sayılmaz
-
-    Her iki göz aynı anda kapanmalı (tek gözün kapanması sayılmaz).
-    EAR moving-average ile kare gürültüsü bastırılır.
-    """
-
-    BLINK_MS_MIN = 80    # ms — bu süreden kısa kapanma gürültüdür
-    BLINK_MS_MAX = 350   # ms — bu süreden uzun kapanma kırpma değildir
-
     def __init__(self):
-        self.cal_buf:  list = []
-        self.calibrated     = False
-        self.thr            = 0.21
-
+        self.cal_buf:   list  = []
+        self.calibrated       = False
+        self.thr              = 0.21
         self._l_buf = deque(maxlen=EAR_SMOOTH_N)
         self._r_buf = deque(maxlen=EAR_SMOOTH_N)
-
         self.was_closed  = False
-        self.close_start = 0.0    # kapanmanın başladığı zaman (time.time())
+        self.close_start = 0.0
         self.times: list = []
         self.last_blink  = 0.0
         self._box        = ""
@@ -365,7 +374,6 @@ class BlinkDetector:
         self._l_buf.append(l_ear)
         self._r_buf.append(r_ear)
 
-        # ── Kalibrasyon ──────────────────────────────────────────────
         if not self.calibrated:
             avg = (self._smooth(self._l_buf) + self._smooth(self._r_buf)) / 2.0
             if avg > 0.22:
@@ -379,27 +387,25 @@ class BlinkDetector:
                 self.calibrated = True
             return
 
-        # ── Kırpma tespiti — gerçek süre ────────────────────────────
         l_closed    = self._smooth(self._l_buf) < self.thr
         r_closed    = self._smooth(self._r_buf) < self.thr
         both_closed = l_closed and r_closed
 
         if both_closed:
             if not self.was_closed:
-                self.close_start = now   # kapanma başladı, zamanı kaydet
+                self.close_start = now
             self.was_closed = True
         else:
             if self.was_closed:
-                # Kapanma bitti — kaç ms sürdü?
-                ms = (now - self.close_start) * 1000.0
+                ms         = (now - self.close_start) * 1000.0
                 since_last = now - self.last_blink
-                if self.BLINK_MS_MIN <= ms <= self.BLINK_MS_MAX and since_last >= BLINK_COOLDOWN:
+                if BLINK_MS_MIN <= ms <= BLINK_MS_MAX and since_last >= BLINK_COOLDOWN:
                     self.times.append(now)
                     self.last_blink = now
                     tlog.log(LogEvent(
-                        event_type = EventType.BLINK_DETECTED,
-                        face_box   = self._box,
-                        extra      = f"toplam={len(self.times)} sure={ms:.0f}ms"))
+                        event_type=EventType.BLINK_DETECTED,
+                        face_box=self._box,
+                        extra=f"toplam={len(self.times)} sure={ms:.0f}ms"))
             self.was_closed = False
 
         self.times = [t for t in self.times if t > now - BLINK_WINDOW_SEC]
@@ -461,10 +467,48 @@ class TrackerPool:
         return matched
 
 # ─────────────────────────────────────────────
-#  UI
+#  OPT-5: ASENKRON KAMERA OKUMA — kamera gecikmeyi ana döngüden ayırır
 # ─────────────────────────────────────────────
+class CameraReader:
+    """Ayrı thread'de kamera okur, ana thread sadece son kareyi alır."""
 
-# Renk paleti (BGR)
+    def __init__(self, index: int = 0):
+        self._cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        self._cap.set(cv2.CAP_PROP_FPS,          CAM_FPS)
+        # Buffer'ı 1'e düşür — en güncel kareyi al
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._frame: np.ndarray | None = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        self._t = threading.Thread(target=self._read_loop, daemon=True)
+        self._t.start()
+
+    def _read_loop(self):
+        while not self._stop.is_set():
+            ret, frame = self._cap.read()
+            if ret:
+                with self._lock:
+                    self._frame = frame
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def is_opened(self) -> bool:
+        return self._cap.isOpened()
+
+    def release(self):
+        self._stop.set()
+        self._t.join(timeout=1)
+        self._cap.release()
+
+# ─────────────────────────────────────────────
+#  UI — OpenCV native, PIL yok
+# ─────────────────────────────────────────────
 C_GREEN = ( 80, 220, 120)
 C_AMBER = ( 40, 170, 255)
 C_RED   = ( 60,  60, 210)
@@ -477,15 +521,16 @@ ALERT_BG = {
     AlertLevel.CRITICAL: ( 10,  10, 160),
 }
 ALERT_TEXT = {
-    AlertLevel.WARNING:  "UYARI  —  Sahte yuz denemesi",
-    AlertLevel.HIGH:     "YUKSEK ALARM  —  Tekrar sahte deneme",
-    AlertLevel.CRITICAL: "KRITIK  —  SISTEM KILITLI",
+    AlertLevel.WARNING:  "UYARI  - Sahte yuz denemesi",
+    AlertLevel.HIGH:     "YUKSEK ALARM  - Tekrar sahte deneme",
+    AlertLevel.CRITICAL: "KRITIK  - SISTEM KILITLI",
 }
 
 def _rect_alpha(frame, x1, y1, x2, y2, color, alpha=0.55):
-    ov = frame.copy()
-    cv2.rectangle(ov, (x1, y1), (x2, y2), color, -1)
-    cv2.addWeighted(ov, alpha, frame, 1 - alpha, 0, frame)
+    roi = frame[y1:y2, x1:x2]
+    overlay = np.full_like(roi, color, dtype=np.uint8)
+    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
+    frame[y1:y2, x1:x2] = roi
 
 def _brackets(frame, x1, y1, x2, y2, color, gap=4, thick=2):
     length = max(14, (x2 - x1) // 5)
@@ -495,42 +540,38 @@ def _brackets(frame, x1, y1, x2, y2, color, gap=4, thick=2):
         (x1 - gap, y2 + gap,  1, -1),
         (x2 + gap, y2 + gap, -1, -1),
     ]:
-        cv2.line(frame, (cx, cy), (cx + sx * length, cy),           color, thick, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy), (cx + sx * length, cy),            color, thick, cv2.LINE_AA)
         cv2.line(frame, (cx, cy), (cx,               cy + sy * length), color, thick, cv2.LINE_AA)
 
 def draw_face(frame, x1, y1, x2, y2, name, sim, status, is_live):
     img_h = frame.shape[0]
-
     bc = C_GREEN if (name != "Bilinmeyen" and is_live) else \
          C_AMBER if name != "Bilinmeyen" else C_RED
     sc = C_GREEN if is_live else (C_RED if "Sahte" in status else C_AMBER)
 
     _brackets(frame, x1, y1, x2, y2, bc)
 
-    # Alt bilgi şeridi
-    bar_h  = 44
-    bx1, bx2 = x1 - 4, x2 + 4
+    bar_h = 44
+    bx1, bx2 = max(0, x1 - 4), min(frame.shape[1], x2 + 4)
     by1 = min(y2 + 4, img_h - bar_h - 2)
-    by2 = by1 + bar_h
+    by2 = min(by1 + bar_h, img_h)
 
     _rect_alpha(frame, bx1, by1, bx2, by2, (12, 12, 12), alpha=0.65)
     cv2.line(frame, (bx1, by1), (bx2, by1), bc, 1, cv2.LINE_AA)
 
-    lbl = f"{name}  %{int(sim * 100)}" if name != "Bilinmeyen" else "Bilinmeyen"
-    frame = put_text(frame, lbl,    (bx1 + 6, by1 + 3),  size=17, color=bc)
-    frame = put_text(frame, status, (bx1 + 6, by1 + 24), size=13, color=sc)
-    return frame
+    lbl = f"{_ascii(name)}  %{int(sim * 100)}" if name != "Bilinmeyen" else "Bilinmeyen"
+    put_text_fast(frame, lbl,    (bx1 + 6, by1 + 18), scale=0.52, color=bc)
+    put_text_fast(frame, status, (bx1 + 6, by1 + 38), scale=0.42, color=sc)
 
-def draw_hud(frame, face_count: int, alert_mgr: AlertManager):
+def draw_hud(frame, face_count: int, fps: float, alert_mgr: AlertManager):
     h, w    = frame.shape[:2]
     now_str = datetime.now().strftime("%H:%M:%S")
 
-    # Sol üst panel
-    _rect_alpha(frame, 0, 0, 220, 36, (10, 10, 10), alpha=0.55)
-    frame = put_text(frame, now_str,              (10, 8), size=16, color=C_WHITE)
-    frame = put_text(frame, f"Yuz: {face_count}", (125, 8), size=16, color=C_DIM)
+    _rect_alpha(frame, 0, 0, 260, 36, (10, 10, 10), alpha=0.55)
+    put_text_fast(frame, now_str,                      (10, 22),  scale=0.55, color=C_WHITE)
+    put_text_fast(frame, f"Yuz:{face_count}",          (130, 22), scale=0.55, color=C_DIM)
+    put_text_fast(frame, f"FPS:{fps:.1f}",             (195, 22), scale=0.55, color=C_DIM)
 
-    # Alarm şeridi
     if alert_mgr.level != AlertLevel.NONE:
         blink_on = True
         if alert_mgr.level == AlertLevel.CRITICAL:
@@ -538,13 +579,58 @@ def draw_hud(frame, face_count: int, alert_mgr: AlertManager):
         bg = ALERT_BG.get(alert_mgr.level, (30, 30, 180))
         if blink_on:
             _rect_alpha(frame, 0, 0, w, 40, bg, alpha=0.85)
-        frame = put_text(frame, ALERT_TEXT.get(alert_mgr.level, "ALARM"),
-                         (12, 10), size=18, color=C_WHITE)
+        put_text_fast(frame, ALERT_TEXT.get(alert_mgr.level, "ALARM"),
+                      (12, 26), scale=0.6, color=C_WHITE, thickness=2)
         if alert_mgr.is_locked():
             rem = max(0, alert_mgr.lockout_until - time.time())
-            frame = put_text(frame, f"{rem:.0f}s", (w - 55, 10),
-                             size=17, color=C_WHITE)
-    return frame
+            put_text_fast(frame, f"{rem:.0f}s", (w - 55, 26),
+                          scale=0.6, color=C_WHITE)
+
+# ─────────────────────────────────────────────
+#  OPT-6: PARALEL YÜZ TESPİTİ
+# ─────────────────────────────────────────────
+class ParallelFaceProcessor:
+    """
+    InsightFace ve MediaPipe'ı ayrı thread'lerde çalıştırır.
+    Her ikisi de aynı frame'i alır; sonuçlar queue ile toplanır.
+    """
+
+    def __init__(self, face_app, face_mesh):
+        self._face_app  = face_app
+        self._face_mesh = face_mesh
+        self._q_in:  "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=1)
+        self._q_out: "queue.Queue[tuple]"             = queue.Queue(maxsize=1)
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def _loop(self):
+        while True:
+            frame = self._q_in.get()
+            if frame is None:
+                break
+            det = self._face_app.get(frame)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mpr = self._face_mesh.process(rgb)
+            try:
+                self._q_out.put_nowait((det, mpr))
+            except queue.Full:
+                pass
+
+    def submit(self, frame: np.ndarray):
+        try:
+            self._q_in.put_nowait(frame)
+        except queue.Full:
+            pass  
+
+    def result(self) -> tuple | None:
+        try:
+            return self._q_out.get_nowait()
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self._q_in.put(None)
+        self._t.join(timeout=2)
 
 # ─────────────────────────────────────────────
 #  ANA FONKSİYON
@@ -552,52 +638,80 @@ def draw_hud(frame, face_count: int, alert_mgr: AlertManager):
 def main():
     global tlog
     tlog = TurnikeLogger()
-    tlog.log(LogEvent(event_type=EventType.SYSTEM_START, extra="v9.0"))
+    tlog.log(LogEvent(event_type=EventType.SYSTEM_START, extra="v10.0-cpu-opt"))
 
-    face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
-    face_app.prepare(ctx_id=0, det_size=(160, 160))
+    # ── Model yükle ──────────────────────────────────────────────
+    try:
+        face_app = FaceAnalysis(name="buffalo_sc",
+                                providers=["CPUExecutionProvider"])
+    except Exception:
+        face_app = FaceAnalysis(name="buffalo_s",
+                                providers=["CPUExecutionProvider"])
+    face_app.prepare(ctx_id=0, det_size=(320, 320))
 
     import mediapipe as mp
     face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=5, refine_landmarks=True,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        max_num_faces=3,             
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5)
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    # ── Kamera ───────────────────────────────────────────────────
+    cam = CameraReader(0)
+    if not cam.is_opened():
         tlog.main.critical("Kamera açılamadı.")
         face_mesh.close(); tlog.close(); return
 
+    # ── Veritabanı ───────────────────────────────────────────────
     known_users  = load_known_faces()
+    face_db      = FaceDatabase(known_users)
+    tlog.main.info(f"{len(known_users)} kullanici yuklendi. DB: {DB_PATH}")
+
     active_sess: dict = {}
     pool         = TrackerPool()
     alert_mgr    = AlertManager()
-    det_faces:   list = []
-    last_det     = 0.0
+    processor    = ParallelFaceProcessor(face_app, face_mesh)
 
-    tlog.main.info(f"{len(known_users)} kullanici yuklendi. DB: {DB_PATH}")
+    fps_buf      = deque(maxlen=30)
+    prev_time    = time.time()
+
+    det_faces: list = []
+    mesh_result     = None
+    last_submit     = 0.0
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret: break
+            ret, frame = cam.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
+                continue
 
             now  = time.time()
             h, w = frame.shape[:2]
             alert_mgr.tick(now)
 
+            fps_buf.append(now - prev_time)
+            prev_time = now
+            fps = 1.0 / (sum(fps_buf) / len(fps_buf) + 1e-6)
+
             if alert_mgr.is_locked():
-                frame = draw_hud(frame, 0, alert_mgr)
+                draw_hud(frame, 0, fps, alert_mgr)
                 cv2.imshow("Turnike", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"): break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
                 continue
 
-            if now - last_det >= FACE_ANALYZE_PERIOD:
-                det_faces = face_app.get(frame)
-                last_det  = now
+            # ── Paralel işleme gönder ─────────────────────────────
+            if now - last_submit >= FACE_ANALYZE_PERIOD:
+                processor.submit(frame.copy())
+                last_submit = now
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mpr = face_mesh.process(rgb)
+            # ── Sonuç al (varsa güncelle, yoksa öncekini kullan) ──
+            res = processor.result()
+            if res is not None:
+                det_faces, mesh_result = res
 
+            # ── Kutuları eşleştir ─────────────────────────────────
             boxes: list = []
             fmap:  dict = {}
             for face in det_faces:
@@ -618,18 +732,19 @@ def main():
                 tr.set_box(bs)
 
                 best_lm, best_d = None, float("inf")
-                if mpr.multi_face_landmarks:
-                    for lm in mpr.multi_face_landmarks:
-                        nx = int(lm.landmark[1].x * w)
-                        ny = int(lm.landmark[1].y * h)
+                if mesh_result and mesh_result.multi_face_landmarks:
+                    for lm_set in mesh_result.multi_face_landmarks:
+                        nx = int(lm_set.landmark[1].x * w)
+                        ny = int(lm_set.landmark[1].y * h)
                         d  = (nx - cx) ** 2 + (ny - cy) ** 2
                         if d < best_d:
-                            best_d, best_lm = d, lm
+                            best_d, best_lm = d, lm_set
 
                 if best_lm:
                     tr.update(best_lm.landmark, w, h, now)
 
-                name, sim = recognize(face.normed_embedding, known_users)
+                # OPT-3: matris ile toplu tanıma
+                name, sim = face_db.recognize(face.normed_embedding)
                 is_live   = tr.decide(name, sim, bs, alert_mgr)
 
                 if is_live:
@@ -647,10 +762,9 @@ def main():
                             spoof_reason = "" if name != "Bilinmeyen" else "unknown_live",
                         ))
 
-                frame = draw_face(frame, x1, y1, x2, y2,
-                                  name, sim, tr.status, is_live)
+                draw_face(frame, x1, y1, x2, y2, name, sim, tr.status, is_live)
 
-            frame = draw_hud(frame, len(boxes), alert_mgr)
+            draw_hud(frame, len(boxes), fps, alert_mgr)
             active_sess = {k: t for k, t in active_sess.items() if now - t <= 60.0}
 
             cv2.imshow("Turnike", frame)
@@ -661,7 +775,8 @@ def main():
         tlog.main.info("Kullanici tarafindan durduruldu.")
     finally:
         tlog.log(LogEvent(event_type=EventType.SYSTEM_STOP))
-        cap.release()
+        processor.stop()
+        cam.release()
         face_mesh.close()
         cv2.destroyAllWindows()
         tlog.close()
