@@ -20,9 +20,9 @@ logger = logging.getLogger(__name__)
 #  AYARLAR
 # ─────────────────────────────────────────────
 DB_PATH        = "turnike.db"
-THRESHOLD      = 0.45   # Benzerlik eşiği (0.4–0.6 arası ideal)
-DETECT_PERIOD  = 0.3    # saniye: her karede algılama yapmak yerine throttle
-RELOAD_PERIOD  = 5.0    # saniye: yeni kayıt varsa otomatik yeniden yükle
+THRESHOLD      = 0.45   
+DETECT_PERIOD  = 0.3  
+RELOAD_PERIOD  = 5.0  
 
 # ─────────────────────────────────────────────
 #  FONT ÖNBELLEĞİ
@@ -84,7 +84,7 @@ def recognize(embedding: np.ndarray, known_users: list[dict]) -> tuple[str, floa
     Döner: (isim, benzerlik_skoru)
     """
     best_name = "Bilinmeyen"
-    best_sim  = 0.0          # BUG FIX: -1 yerine 0.0 → negatif skor asla eşik geçmez
+    best_sim  = 0.0          
 
     for user in known_users:
         sim = float(np.dot(embedding, user["emb"]))
@@ -100,11 +100,9 @@ def recognize(embedding: np.ndarray, known_users: list[dict]) -> tuple[str, floa
 def main() -> None:
     os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
-    # Model yükle
     face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(320, 320))
 
-    # Kamera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.critical("❌ Kamera açılamadı. Program sonlandırılıyor.")
@@ -129,12 +127,10 @@ def main() -> None:
             now = time.time()
             h, w = frame.shape[:2]
 
-            # ── Periyodik yüz algılama (throttle) ─────────────────
             if now - last_detect >= DETECT_PERIOD:
                 detected_faces = face_app.get(frame)
                 last_detect = now
 
-            # ── Periyodik DB yenileme: yeni kayıt eklenmişse güncelle
             if now - last_reload >= RELOAD_PERIOD:
                 current_count = get_user_count()
                 if current_count != known_count:
@@ -143,14 +139,13 @@ def main() -> None:
                     logger.info("🔄 Kullanıcı listesi güncellendi.")
                 last_reload = now
 
-            # ── Her yüz için tanıma ve görselleştirme ─────────────
             for face in detected_faces:
                 x1 = max(0, int(face.bbox[0]))
                 y1 = max(0, int(face.bbox[1]))
                 x2 = min(w, int(face.bbox[2]))
                 y2 = min(h, int(face.bbox[3]))
 
-                if x2 <= x1 or y2 <= y1:   # geçersiz kutu
+                if x2 <= x1 or y2 <= y1:   
                     continue
 
                 name, sim = recognize(face.normed_embedding, known_users)
@@ -165,7 +160,6 @@ def main() -> None:
                     color=color,
                 )
 
-            # ── FPS / kullanıcı sayısı bilgi satırı ───────────────
             frame = put_text(
                 frame,
                 f"Kayıtlı: {known_count} kişi",
