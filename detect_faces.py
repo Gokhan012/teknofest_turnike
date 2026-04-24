@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 #  AYARLAR
 # ─────────────────────────────────────────────
-DETECT_PERIOD  = 0.5    # saniye: AI modeli ne sıklıkla çalışsın
+DETECT_PERIOD  = 0.5    
 CAM_WIDTH      = 640
 CAM_HEIGHT     = 480
 
@@ -89,13 +89,11 @@ class FPSCounter:
 def main() -> None:
     os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
-    # Model yükle
     logger.info("🔄 buffalo_s modeli yükleniyor (SCRFD + ArcFace)...")
     face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(320, 320))
     logger.info("✅ Model hazır.")
 
-    # Kamera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.critical("❌ Kamera açılamadı. Program sonlandırılıyor.")
@@ -123,12 +121,10 @@ def main() -> None:
             now = time.time()
             h, w = frame.shape[:2]
 
-            # ── Throttle: sadece DETECT_PERIOD'da bir AI çalıştır ──
             if now - last_detect >= DETECT_PERIOD:
                 detected_faces = face_app.get(frame)
                 last_detect = now
 
-            # ── Her yüz için görselleştirme ───────────────────────
             for face in detected_faces:
                 x1 = max(0, int(face.bbox[0]))
                 y1 = max(0, int(face.bbox[1]))
@@ -141,13 +137,10 @@ def main() -> None:
                 det_score = float(face.det_score)
                 color = (0, 255, 0) if det_score >= 0.7 else (0, 165, 255)
 
-                # Bounding box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                # Landmark noktaları
                 draw_landmarks(frame, getattr(face, "kps", None))
 
-                # Embedding bilgisi: boyut + L2 normu (kayıt kalitesi göstergesi)
                 emb  = face.normed_embedding
                 norm = float(np.linalg.norm(emb))
                 frame = put_text(
@@ -158,7 +151,6 @@ def main() -> None:
                     color=color,
                 )
 
-            # ── HUD: FPS + yüz sayısı ─────────────────────────────
             fps = fps_counter.tick()
             frame = put_text(frame, f"FPS: {fps:.1f}", (8, 8),  size=18, color=(200, 200, 200))
             frame = put_text(frame, f"Yüz: {len(detected_faces)}", (8, 30), size=18, color=(200, 200, 200))
