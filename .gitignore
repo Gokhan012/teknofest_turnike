@@ -8,7 +8,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Mediapipe ve indirdiğimiz ağır paketler (.whl dosyaları)
+# Mediapipe ve ve diğer paketler
 *.whl
 
 # Veritabanı loglar
