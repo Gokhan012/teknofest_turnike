@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 #  AYARLAR
 # ─────────────────────────────────────────────
 DB_PATH             = "turnike.db"
-DETECT_PERIOD       = 0.3          # saniye: her karede algılama yapmak yerine throttle
+DETECT_PERIOD       = 0.3          
 
 # ─────────────────────────────────────────────
 #  FONT YARDIMCISI
@@ -121,18 +121,15 @@ def largest_face(faces: list):
 def main() -> None:
     init_db()
 
-    # Model yükle
     os.environ["OPENCV_LOG_LEVEL"] = "OFF"
     face_app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(160, 160))
 
-    # Kullanıcı bilgisi
     print("\n─── Kullanıcı Bilgileri ───")
     user_name, user_id = get_user_input()
     print(f"\n👤 Kayıt edilecek: {user_name} | {user_id}")
     print("📷 Kamera açılıyor... Yüzünüzü çerçeveye alın ve [S] tuşuna basın. Çıkış: [Q]\n")
 
-    # Kamera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         logger.critical("❌ Kamera açılamadı. Program sonlandırılıyor.")
@@ -152,7 +149,6 @@ def main() -> None:
             now = time.time()
             h, w = frame.shape[:2]
 
-            # Throttle: her 0.3 sn'de bir algıla
             if now - last_detect >= DETECT_PERIOD:
                 detected_faces = face_app.get(frame)
                 last_detect = now
@@ -176,7 +172,6 @@ def main() -> None:
             cv2.imshow("Kayıt Ekranı", display)
             key = cv2.waitKey(1) & 0xFF
 
-            # Kaydet
             if key == ord("s"):
                 if not detected_faces:
                     logger.warning("⚠ Yüz algılanmadı, önce kameraya bakın.")
@@ -186,14 +181,12 @@ def main() -> None:
                     if save_user(user_name, user_id, embedding):
                         logger.info(f"✅ '{user_name}' başarıyla kaydedildi!")
                         saved = True
-                        # Onay mesajı göster
                         confirm = frame.copy()
                         confirm = put_text(confirm, f"✅ {user_name} kaydedildi!", (10, 10), 24, (0, 255, 0))
                         cv2.imshow("Kayıt Ekranı", confirm)
                         cv2.waitKey(1500)
                         break
 
-            # Çıkış
             elif key == ord("q"):
                 logger.info("⛔ Kullanıcı kayıt iptal etti.")
                 break
