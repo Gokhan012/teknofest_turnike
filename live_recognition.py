@@ -34,7 +34,6 @@ CAM_WIDTH  = 640
 CAM_HEIGHT = 480
 CAM_FPS    = 30
 
-# Göz kırpma
 CALIBRATION_FRAMES = 60
 EAR_RATIO          = 0.72
 EAR_SMOOTH_N       = 2
@@ -92,14 +91,12 @@ class TurnikeLogger:
         self._setup_loggers()
         self._setup_db()
         self._jsonl = open(JSONL_PATH, "a", encoding="utf-8")
-        # Kalıcı DB bağlantısı — her seferinde açıp kapama
         self._db_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        self._db_conn.execute("PRAGMA journal_mode=WAL")   # eş zamanlı okuma
-        self._db_conn.execute("PRAGMA synchronous=NORMAL") # daha hızlı yazma
+        self._db_conn.execute("PRAGMA journal_mode=WAL")   
+        self._db_conn.execute("PRAGMA synchronous=NORMAL")
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
-    # ── Logger kurulum ────────────────────────────────────────────
     def _setup_loggers(self):
         fmt     = "%(asctime)s | %(levelname)-8s | %(message)s"
         datefmt = "%d-%m-%Y %H:%M:%S"
@@ -153,7 +150,6 @@ class TurnikeLogger:
             """)
             c.commit()
 
-    # ── Kuyruk işçisi ─────────────────────────────────────────────
     def _run(self):
         while True:
             ev = self._q.get()
@@ -176,7 +172,7 @@ class TurnikeLogger:
             self.sec.warning(msg)
         else:
             self.main.info(msg)
-        self._q.put(event)   # I/O'yu arka plana gönder
+        self._q.put(event)   
 
     def _fmt(self, e: LogEvent) -> str:
         parts = [f"[{e.event_type}]"]
@@ -218,7 +214,7 @@ class TurnikeLogger:
         self._jsonl.close()
         self._db_conn.close()
 
-tlog: TurnikeLogger = None  # type: ignore
+tlog: TurnikeLogger = None 
 
 # ─────────────────────────────────────────────
 #  ALARM
@@ -294,18 +290,17 @@ class FaceDatabase:
     def __init__(self, known: list):
         self.names = [u["name"] for u in known]
         if known:
-            self.matrix = np.stack([u["emb"] for u in known], axis=0)  # (N, D)
+            self.matrix = np.stack([u["emb"] for u in known], axis=0)  
         else:
             self.matrix = np.empty((0, 512), dtype=np.float32)
 
     def recognize(self, emb: np.ndarray) -> tuple[str, float]:
         if self.matrix.shape[0] == 0:
             return "Bilinmeyen", 0.0
-        # Normalize et
         n = np.linalg.norm(emb)
         if n > 1e-6:
             emb = emb / n
-        sims = self.matrix @ emb          # (N,) — tek matris çarpımı
+        sims = self.matrix @ emb          
         idx  = int(np.argmax(sims))
         sim  = float(sims[idx])
         name = self.names[idx] if sim >= THRESHOLD else "Bilinmeyen"
@@ -477,7 +472,6 @@ class CameraReader:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
         self._cap.set(cv2.CAP_PROP_FPS,          CAM_FPS)
-        # Buffer'ı 1'e düşür — en güncel kareyi al
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self._frame: np.ndarray | None = None
         self._lock  = threading.Lock()
@@ -640,7 +634,6 @@ def main():
     tlog = TurnikeLogger()
     tlog.log(LogEvent(event_type=EventType.SYSTEM_START, extra="v10.0-cpu-opt"))
 
-    # ── Model yükle ──────────────────────────────────────────────
     try:
         face_app = FaceAnalysis(name="buffalo_sc",
                                 providers=["CPUExecutionProvider"])
@@ -701,17 +694,14 @@ def main():
                     break
                 continue
 
-            # ── Paralel işleme gönder ─────────────────────────────
             if now - last_submit >= FACE_ANALYZE_PERIOD:
                 processor.submit(frame.copy())
                 last_submit = now
 
-            # ── Sonuç al (varsa güncelle, yoksa öncekini kullan) ──
             res = processor.result()
             if res is not None:
                 det_faces, mesh_result = res
 
-            # ── Kutuları eşleştir ─────────────────────────────────
             boxes: list = []
             fmap:  dict = {}
             for face in det_faces:
@@ -743,7 +733,6 @@ def main():
                 if best_lm:
                     tr.update(best_lm.landmark, w, h, now)
 
-                # OPT-3: matris ile toplu tanıma
                 name, sim = face_db.recognize(face.normed_embedding)
                 is_live   = tr.decide(name, sim, bs, alert_mgr)
 
